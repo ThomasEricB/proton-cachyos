@@ -1,0 +1,110 @@
+From 46461523e5b8695fef0d3830049df6f56bbaa9f6 Mon Sep 17 00:00:00 2001
+From: Thomas Eric <thombelcar@gmail.com>
+Date: Tue, 29 Sep 2026 11:52:34 -0300
+Subject: [PATCH] gamefixes-steam: Add The Witcher 3 (292030) fix
+
+Since the Remastered update (5.00) the game checks for wine_get_version
+and skips NVIDIA Streamline initialization when it is found. DLSS, Ray
+Reconstruction, Frame Generation and Reflex are then reported as not
+supported ("DLSS is not supported") and the ray tracing options stay
+locked, even though the driver and NGX work fine.
+
+Enable HideWineExports in the prefix. It has to be the global
+HKCU\Software\Wine value: Wine calls hidden_exports_init() with the path
+of ntdll.dll itself, so an AppDefaults\witcher3.exe value is never read.
+Only applied when an NVIDIA display controller is present (desktop, PRIME
+and multi-GPU setups), and only written once per prefix.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gamefixes-steam/292030.py   | 68 +++++++++++++++++++++++++++++++++++++
+ gamefixes-umu/umu-292030.py |  1 +
+ 2 files changed, 69 insertions(+)
+ create mode 100755 gamefixes-steam/292030.py
+ create mode 120000 gamefixes-umu/umu-292030.py
+
+diff --git a/gamefixes-steam/292030.py b/gamefixes-steam/292030.py
+new file mode 100755
+index 0000000..79698a6
+--- /dev/null
++++ b/gamefixes-steam/292030.py
+@@ -0,0 +1,68 @@
++"""Game fix for The Witcher 3: Wild Hunt"""
++
++import glob
++import os
++
++from protonfixes import util
++from protonfixes.logger import log
++
++_WINE_KEY = r'HKCU\Software\Wine'
++_USER_REG_SECTION = r'[Software\\Wine]'
++
++
++def _has_nvidia_gpu() -> bool:
++    """Check sysfs for an NVIDIA display controller (desktop, PRIME and multi-GPU setups)"""
++    for device in glob.glob('/sys/bus/pci/devices/*'):
++        try:
++            with open(os.path.join(device, 'vendor'), encoding='ascii') as f:
++                vendor = f.read().strip()
++            with open(os.path.join(device, 'class'), encoding='ascii') as f:
++                device_class = f.read().strip()
++        except OSError:
++            continue
++        # PCI base class 0x03 is display controller (VGA, 3D, other)
++        if vendor == '0x10de' and device_class.startswith('0x03'):
++            return True
++    return False
++
++
++def _hide_wine_exports_set() -> bool:
++    """Check whether HideWineExports is already enabled in the prefix's user.reg"""
++    user_reg = util.protonprefix() / 'user.reg'
++    try:
++        with open(user_reg, encoding='utf-8', errors='replace') as f:
++            in_section = False
++            for line in f:
++                line = line.strip()
++                if line.startswith('['):
++                    # Section headers are followed by a timestamp, match the exact key only
++                    in_section = (
++                        line.split(']')[0].lower() + ']' == _USER_REG_SECTION.lower()
++                    )
++                elif in_section and line.lower() == '"hidewineexports"="y"':
++                    return True
++    except OSError:
++        pass
++    return False
++
++
++def main() -> None:
++    """Hide Wine exports on NVIDIA GPUs.
++
++    Since the Remastered update (5.00), the game checks for wine_get_version
++    and, when found, does not initialize NVIDIA Streamline. DLSS, DLSS Ray
++    Reconstruction, Frame Generation and Reflex are then reported as not
++    supported and the ray tracing options stay locked.
++
++    The setting has to be prefix wide: Wine only reads HideWineExports from
++    the global Wine key (its AppDefaults lookup uses the name of ntdll.dll
++    itself, not the executable). Skipped when no NVIDIA GPU is present.
++    """
++    if not _has_nvidia_gpu():
++        log.info('No NVIDIA GPU found, not hiding Wine exports')
++        return
++
++    if _hide_wine_exports_set():
++        return
++
++    util.regedit_add(_WINE_KEY, 'HideWineExports', 'REG_SZ', 'Y')
+diff --git a/gamefixes-umu/umu-292030.py b/gamefixes-umu/umu-292030.py
+new file mode 120000
+index 0000000..0e795e9
+--- /dev/null
++++ b/gamefixes-umu/umu-292030.py
+@@ -0,0 +1 @@
++../gamefixes-steam/292030.py
+\ No newline at end of file
+-- 
+2.55.0
+
