@@ -1,0 +1,190 @@
+From 659db91fcd34c3bdea544e22f4d03db530eb5412 Mon Sep 17 00:00:00 2001
+From: Thomas Eric <thombelcar@gmail.com>
+Date: Tue, 29 Sep 2026 11:52:43 -0300
+Subject: [PATCH] vkd3d: Add RTAS internal scratch and result padding for
+ Witcher 3.
+
+The Witcher 3 (292030) with ray tracing enabled corrupts memory on NVIDIA
+since the Remastered update. With the application provided scratch the
+game crashes on load inside its own GPU suballocator, and in outdoor
+scenes the GPU hangs with Xid 109 / VK_ERROR_DEVICE_LOST
+(vkd3d-proton#3226).
+
+Add two config options and enable both for witcher3.exe:
+
+- rtas_internal_scratch: ignore ScratchAccelerationStructureData and give
+  every RTAS build its own scratch from the command allocator pool, sized
+  to what vkCmdBuildAccelerationStructuresKHR actually needs. Builds no
+  longer share scratch, so hazard tracking is skipped for them. Falls back
+  to the application scratch if the allocation fails. The DEVICE_STORAGE
+  scratch block size is raised to 32 MiB so multi-MB builds are recycled
+  instead of creating a buffer per build.
+- rtas_pad_result_size: report twice the required ResultDataMaxSizeInBytes
+  so the game's RTAS suballocations get headroom.
+
+Tested on an RTX 5090 (nvidia 615.71.09) with this build and no
+VKD3D_CONFIG set: the witcher3.exe profile enables both options, RT on load
+no longer crashes, and an 11 minute RT session outdoors had no hang, no Xid
+and no scratch fallbacks. Without the padding the GPU still hung outdoors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/private/config_flag_decl.h |  2 ++
+ include/private/config_flags.h     |  2 +-
+ libs/vkd3d/command.c               | 39 +++++++++++++++++++++++++++---
+ libs/vkd3d/device.c                | 13 ++++++++++
+ libs/vkd3d/device_workarounds.c    |  6 +++--
+ libs/vkd3d/vkd3d_private.h         |  1 +
+ 6 files changed, 56 insertions(+), 7 deletions(-)
+
+diff --git a/include/private/config_flag_decl.h b/include/private/config_flag_decl.h
+index 27ee569f..d594f6e2 100644
+--- a/include/private/config_flag_decl.h
++++ b/include/private/config_flag_decl.h
+@@ -74,3 +74,5 @@ VKD3D_DECL_CONFIG("debug_wave64_simulation", DEBUG_WAVE64_SIMULATION)
+ VKD3D_DECL_CONFIG("fail_unsupported_state_template", FAIL_UNSUPPORTED_STATE_TEMPLATE)
+ VKD3D_DECL_CONFIG("ignore_shared_fence", IGNORE_SHARED_FENCE)
+ VKD3D_DECL_CONFIG("adreno_7xx_extra_compat", ADRENO_7XX_EXTRA_COMPAT)
++VKD3D_DECL_CONFIG("rtas_internal_scratch", RTAS_INTERNAL_SCRATCH)
++VKD3D_DECL_CONFIG("rtas_pad_result_size", RTAS_PAD_RESULT_SIZE)
+diff --git a/include/private/config_flags.h b/include/private/config_flags.h
+index e9f3ab67..a5768a30 100644
+--- a/include/private/config_flags.h
++++ b/include/private/config_flags.h
+@@ -31,7 +31,7 @@ struct vkd3d_config_flags_bitfield
+ 	 * we may end up with stray uninitialized bits which can subtly break bitwise operations later.
+ 	 * Adding more configs will cause the static assert below to fail,
+ 	 * which indicates the need to subtract a reserved bit. */
+-	uint32_t reserved0 : 22;
++	uint32_t reserved0 : 20;
+ };
+ 
+ STATIC_ASSERT(sizeof(struct vkd3d_config_flags_bitfield) == 12);
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 4113ea9b..38747877 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -21017,6 +21017,30 @@ static void d3d12_command_list_free_rtas_batch(struct d3d12_command_list *list)
+     vkd3d_free(rtas_batch->postbuild_infos);
+ }
+ 
++static bool d3d12_command_list_allocate_internal_rtas_scratch(struct d3d12_command_list *list,
++        VkDeviceSize size, VkDeviceAddress *va)
++{
++    const struct d3d12_device *device = list->device;
++    struct vkd3d_scratch_allocation scratch;
++
++    /* Some applications provide less scratch than the driver needs for the build they record.
++     * Ignore the application scratch and use our own, sized to what the driver reports. */
++    if (!size)
++        return false;
++
++    if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
++            VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE, size,
++            device->device_info.acceleration_structure_properties.minAccelerationStructureScratchOffsetAlignment,
++            ~0u, &scratch))
++    {
++        WARN("Failed to allocate %"PRIu64" bytes of internal RTAS scratch, using application scratch.\n", size);
++        return false;
++    }
++
++    *va = scratch.va;
++    return true;
++}
++
+ static bool d3d12_command_list_register_rtas_scratch_range(
+         struct d3d12_command_list *list, VkDeviceAddress scratch, VkDeviceSize size)
+ {
+@@ -21438,6 +21462,7 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
+     VkBuildAccelerationStructureModeKHR old_mode;
+     uint32_t primitive_counts_scratch[64];
+     enum vkd3d_rtas_kind rtas_kind;
++    VkDeviceSize scratch_size;
+     uint32_t *primitive_counts;
+     uint32_t geometry_count;
+ 
+@@ -21517,10 +21542,16 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
+     build_info->flags = old_flags;
+     build_info->mode = old_mode;
+ 
+-    if (d3d12_command_list_register_rtas_scratch_range(
+-            list, desc->ScratchAccelerationStructureData,
+-            (desc->Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE)
+-                ? size_info.updateScratchSize : size_info.buildScratchSize))
++    scratch_size = (desc->Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE)
++            ? size_info.updateScratchSize : size_info.buildScratchSize;
++
++    if (VKD3D_CONFIG_FLAG_IS_SET(RTAS_INTERNAL_SCRATCH) &&
++            d3d12_command_list_allocate_internal_rtas_scratch(list, scratch_size, &build_info->scratchData.deviceAddress))
++    {
++        /* Every build gets its own scratch allocation, so there are no scratch hazards to track. */
++    }
++    else if (d3d12_command_list_register_rtas_scratch_range(
++            list, desc->ScratchAccelerationStructureData, scratch_size))
+     {
+         /* The batch is restarted, need to rebuild. */
+         d3d12_command_list_flush_rtas_barrier(list);
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 5834f16c..38fb9d6f 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -7962,6 +7962,11 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
+     info->ResultDataMaxSizeInBytes = size_info.accelerationStructureSize;
+     info->ScratchDataSizeInBytes = size_info.buildScratchSize;
+ 
++    /* Witcher 3 (vkd3d-proton#3226) hangs the GPU in RT scenes with large geometry unless the
++     * application's acceleration structure suballocations get extra headroom. */
++    if (VKD3D_CONFIG_FLAG_IS_SET(RTAS_PAD_RESULT_SIZE))
++        info->ResultDataMaxSizeInBytes *= 2;
++
+     if (build_info.type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
+         VKD3D_CONFIG_FLAG_IS_SET(RTAS_ALLOW_BLAS_REBUILD_SIZES))
+     {
+@@ -10444,6 +10449,14 @@ static void vkd3d_scratch_pool_init(struct d3d12_device *device)
+      * Tuned for Starfield which is the "worst case scenario" so far. */
+     device->scratch_pools[VKD3D_SCRATCH_POOL_KIND_INDIRECT_PREPROCESS].scratch_buffer_size =
+             VKD3D_SCRATCH_BUFFER_COUNT_INDIRECT_PREPROCESS;
++
++    /* Internal RTAS scratch needs multi-MB allocations per build. Avoid creating
++     * and destroying a dedicated buffer for every build. */
++    if (VKD3D_CONFIG_FLAG_IS_SET(RTAS_INTERNAL_SCRATCH))
++    {
++        device->scratch_pools[VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE].block_size =
++                VKD3D_SCRATCH_BUFFER_SIZE_RTAS_INTERNAL;
++    }
+ }
+ 
+ static HRESULT d3d12_device_create_sparse_init_timeline(struct d3d12_device *device)
+diff --git a/libs/vkd3d/device_workarounds.c b/libs/vkd3d/device_workarounds.c
+index 213f9108..bc9f13ce 100644
+--- a/libs/vkd3d/device_workarounds.c
++++ b/libs/vkd3d/device_workarounds.c
+@@ -109,9 +109,11 @@ static const struct vkd3d_instance_application_meta application_override[] = {
+     { VKD3D_STRING_COMPARE_EXACT, "DXMD.exe", VKD3D_CONFIG_FLAG_STATIC(FORCE_INITIAL_TRANSITION) },
+     /* Dead Space (2023) (1693980) */
+     { VKD3D_STRING_COMPARE_EXACT, "Dead Space.exe", VKD3D_CONFIG_FLAG_STATIC(FORCE_DEDICATED_IMAGE_ALLOCATION) },
+-    /* Witcher 3 (2023) (292030). Misses ALLOW_REBUILD when querying for RTAS sizes. */
++    /* Witcher 3 (2023) (292030). Misses ALLOW_REBUILD when querying for RTAS sizes.
++     * RT corrupts memory with app provided RTAS scratch and needs RTAS result headroom (vkd3d-proton#3226). */
+     { VKD3D_STRING_COMPARE_EXACT, "witcher3.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(
+-            .DISABLE_SIMULTANEOUS_UAV_COMPRESSION = 1, .RTAS_ALLOW_BLAS_REBUILD_SIZES = 1) },
++            .DISABLE_SIMULTANEOUS_UAV_COMPRESSION = 1, .RTAS_ALLOW_BLAS_REBUILD_SIZES = 1,
++            .RTAS_INTERNAL_SCRATCH = 1, .RTAS_PAD_RESULT_SIZE = 1) },
+     /* Age of Wonders 4 (1669000). Extremely stuttery performance with ReBAR. */
+     { VKD3D_STRING_COMPARE_EXACT, "AOW4.exe", VKD3D_CONFIG_FLAG_STATIC(NO_UPLOAD_HVV) },
+     /* Red Dead Redemption (2668510). Inconsistent performance with ReBAR at cutscenes of the game. */
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 43637a5a..b3fcf017 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2705,6 +2705,7 @@ struct d3d12_descriptor_pool_cache
+ 
+ #define VKD3D_SCRATCH_BUFFER_SIZE_DEFAULT (1ull << 20)
+ #define VKD3D_SCRATCH_BUFFER_SIZE_DGCC_PREPROCESS_NV (32ull << 20)
++#define VKD3D_SCRATCH_BUFFER_SIZE_RTAS_INTERNAL (32ull << 20)
+ #define VKD3D_SCRATCH_BUFFER_SIZE_PREPROCESS_NV (4ull << 20)
+ #define VKD3D_SCRATCH_BUFFER_COUNT_DEFAULT (32u)
+ #define VKD3D_SCRATCH_BUFFER_COUNT_INDIRECT_PREPROCESS (128u)
+-- 
+2.55.0
+
